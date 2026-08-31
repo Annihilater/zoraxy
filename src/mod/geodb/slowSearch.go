@@ -53,6 +53,18 @@ func isIPv6InRange(startIP, endIP, testIP string) (bool, error) {
 
 // Slow country code lookup for
 func (s *Store) slowSearchIpv4(ipAddr string) string {
+	// Check reserved IP zones
+	reservedZone := getReservedIPZone(ipAddr)
+	if reservedZone != "" {
+		return reservedZone
+	}
+
+	//Check if already in cache
+	cc := s.GetSlowSearchCachedIpv4(ipAddr)
+	if cc != "" {
+		return cc
+	}
+
 	for _, ipRange := range s.geodb {
 		startIp := ipRange[0]
 		endIp := ipRange[1]
@@ -60,13 +72,29 @@ func (s *Store) slowSearchIpv4(ipAddr string) string {
 
 		inRange, _ := isIPv4InRange(startIp, endIp, ipAddr)
 		if inRange {
+			//Add to cache
+			s.slowLookupCacheIpv4.Store(ipAddr, cc)
 			return cc
 		}
 	}
+
+	// Not found in geodb
 	return ""
 }
 
 func (s *Store) slowSearchIpv6(ipAddr string) string {
+	// Check reserved IP zones
+	reservedZone := getReservedIPZone(ipAddr)
+	if reservedZone != "" {
+		return reservedZone
+	}
+
+	//Check if already in cache
+	cc := s.GetSlowSearchCachedIpv6(ipAddr)
+	if cc != "" {
+		return cc
+	}
+
 	for _, ipRange := range s.geodbIpv6 {
 		startIp := ipRange[0]
 		endIp := ipRange[1]
@@ -74,8 +102,30 @@ func (s *Store) slowSearchIpv6(ipAddr string) string {
 
 		inRange, _ := isIPv6InRange(startIp, endIp, ipAddr)
 		if inRange {
+			//Add to cache
+			s.slowLookupCacheIpv6.Store(ipAddr, cc)
 			return cc
 		}
+	}
+
+	// Not found in geodb
+	return ""
+}
+
+// GetSlowSearchCachedIpv4 return the country code for the given ipv4 address, return empty string if not found
+func (s *Store) GetSlowSearchCachedIpv4(ipAddr string) string {
+	cc, ok := s.slowLookupCacheIpv4.Load(ipAddr)
+	if ok {
+		return cc.(string)
+	}
+	return ""
+}
+
+// GetSlowSearchCachedIpv6 return the country code for the given ipv6 address, return empty string if not found
+func (s *Store) GetSlowSearchCachedIpv6(ipAddr string) string {
+	cc, ok := s.slowLookupCacheIpv6.Load(ipAddr)
+	if ok {
+		return cc.(string)
 	}
 	return ""
 }

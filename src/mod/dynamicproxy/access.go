@@ -1,22 +1,22 @@
 package dynamicproxy
 
 import (
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 
 	"imuslab.com/zoraxy/mod/access"
-	"imuslab.com/zoraxy/mod/netutils"
+	"imuslab.com/zoraxy/mod/eventsystem"
+	"imuslab.com/zoraxy/mod/plugins/zoraxy_plugin/events"
 )
 
 // Handle access check (blacklist / whitelist), return true if request is handled (aka blocked)
 // if the return value is false, you can continue process the response writer
-func (h *ProxyHandler) handleAccessRouting(ruleID string, w http.ResponseWriter, r *http.Request) bool {
+func (h *ProxyHandler) handleAccessRouting(ruleID string, w http.ResponseWriter, r *http.Request, sep *ProxyEndpoint) bool {
 	accessRule, err := h.Parent.Option.AccessController.GetAccessRuleByID(ruleID)
 	if err != nil {
 		//Unable to load access rule. Target rule not found?
-		log.Println("[Proxy] Unable to load access rule: " + ruleID)
+		h.Parent.Option.Logger.PrintAndLog("proxy-access", "Unable to load access rule: "+ruleID, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte("500 - Internal Server Error"))
 		return true
@@ -24,7 +24,7 @@ func (h *ProxyHandler) handleAccessRouting(ruleID string, w http.ResponseWriter,
 
 	isBlocked, blockedReason := accessRequestBlocked(accessRule, h.Parent.Option.WebDirectory, w, r)
 	if isBlocked {
-		h.logRequest(r, false, 403, blockedReason, "")
+		h.Parent.logRequest(r, false, 403, blockedReason, r.Host, "", sep)
 	}
 	return isBlocked
 }
@@ -33,7 +33,7 @@ func (h *ProxyHandler) handleAccessRouting(ruleID string, w http.ResponseWriter,
 // For string, it will return the blocked reason (if any)
 func accessRequestBlocked(accessRule *access.AccessRule, templateDirectory string, w http.ResponseWriter, r *http.Request) (bool, string) {
 	//Check if this ip is in blacklist
-	clientIpAddr := netutils.GetRequesterIP(r)
+	clientIpAddr := accessRule.GetClientIP(r)
 	if accessRule.IsBlacklisted(clientIpAddr) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusForbidden)
@@ -43,6 +43,23 @@ func accessRequestBlocked(accessRule *access.AccessRule, templateDirectory strin
 		} else {
 			w.Write(template)
 		}
+
+		// Emit blacklisted IP blocked event
+		// Get the comment for this IP
+		comment, err := accessRule.GetBlacklistedIPComment(clientIpAddr)
+		if err != nil {
+			comment = "blacklisted"
+		}
+		eventsystem.Publisher.Emit(
+			&events.BlacklistedIPBlockedEvent{
+				IP:           clientIpAddr,
+				Comment:      comment,
+				RequestedURL: r.URL.String(),
+				Hostname:     r.Host,
+				UserAgent:    r.Header.Get("User-Agent"),
+				Method:       r.Method,
+			},
+		)
 
 		return true, "blacklist"
 	}

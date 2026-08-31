@@ -16,13 +16,6 @@ func (s *Store) search(ip string) string {
 		ip = strings.Split(ip, ",")[0]
 		ip = strings.TrimSpace(ip)
 	}
-	//See if there are cached country code for this ip
-	/*
-		ccc, ok := s.geoipCache.Load(ip)
-		if ok {
-			return ccc.(string)
-		}
-	*/
 
 	//Search in geotrie tree
 	cc := ""
@@ -58,6 +51,9 @@ func constrctTrieTree(data [][]string) *trie {
 		tt.insert(startIp, cc)
 		tt.insert(endIp, cc)
 	}
+
+	// Sort the ranges for binary search after all inserts
+	tt.build()
 
 	return tt
 }

@@ -6,8 +6,11 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"imuslab.com/zoraxy/mod/acme"
@@ -38,7 +41,34 @@ func initACME() *acme.ACMEHandler {
 		port = getRandomPort(30000)
 	}
 
-	return acme.NewACME("https://acme-v02.api.letsencrypt.org/directory", strconv.Itoa(port), sysdb)
+	keyFileMode := parseACMEFileMode(*acmeKeyFileMode, 0600, "acmekeymode")
+	publicFileMode := parseACMEFileMode(*acmePublicFileMode, 0644, "acmepublicmode")
+
+	return acme.NewACME(strconv.Itoa(port), sysdb, SystemWideLogger, *acmeTestMode, keyFileMode, publicFileMode)
+}
+
+func parseACMEFileMode(raw string, fallback os.FileMode, flagName string) os.FileMode {
+	parsed, err := strconv.ParseUint(raw, 8, 32)
+	if err != nil {
+		SystemWideLogger.Println("Invalid " + flagName + " value " + raw + ", using fallback " + fmt.Sprintf("%#o", fallback))
+		return fallback
+	}
+
+	return os.FileMode(parsed)
+}
+
+// Restart ACME handler and auto renewer
+func restartACMEHandler() {
+	SystemWideLogger.Println("Restarting ACME handler")
+	//Clos the current handler and auto renewer
+	acmeHandler.Close()
+	acmeAutoRenewer.Close()
+	acmeDeregisterSpecialRoutingRule()
+
+	//Reinit the handler with a new random port
+	acmeHandler = initACME()
+
+	acmeRegisterSpecialRoutingRule()
 }
 
 // create the special routing rule for ACME
@@ -82,33 +112,50 @@ func acmeRegisterSpecialRoutingRule() {
 	}
 }
 
+// remove the special routing rule for ACME
+func acmeDeregisterSpecialRoutingRule() {
+	SystemWideLogger.Println("Removing ACME routing rule")
+	dynamicProxyRouter.RemoveRoutingRule("acme-autorenew")
+}
+
 // This function check if the renew setup is satisfied. If not, toggle them automatically
 func AcmeCheckAndHandleRenewCertificate(w http.ResponseWriter, r *http.Request) {
-	isForceHttpsRedirectEnabledOriginally := false
+	requireRestoreHttpsRedirect := false
+	requireRestorePort80 := false
 	dnsPara, _ := utils.PostBool(r, "dns")
 	if !dnsPara {
-		if dynamicProxyRouter.Option.Port == 443 {
+		//HTTP-01 challenge
+		switch dynamicProxyRouter.Option.Port {
+		case 443:
+			//Check if port 80 is enabled
+			if !dynamicProxyRouter.Option.ListenOnPort80 {
+				//Enable port 80 temporarily
+				SystemWideLogger.PrintAndLog("ACME", "Temporarily enabling port 80 listener to handle ACME request ", nil)
+				dynamicProxyRouter.UpdatePort80ListenerState(true)
+				requireRestorePort80 = true
+				time.Sleep(2 * time.Second)
+			}
+
 			//Enable port 80 to 443 redirect
 			if !dynamicProxyRouter.Option.ForceHttpsRedirect {
 				SystemWideLogger.Println("Temporary enabling HTTP to HTTPS redirect for ACME certificate renew requests")
 				dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(true)
-			} else {
-				//Set this to true, so after renew, do not turn it off
-				isForceHttpsRedirectEnabledOriginally = true
+				//Mark that we need to restore this setting after renewal
+				requireRestoreHttpsRedirect = true
 			}
 
-		} else if dynamicProxyRouter.Option.Port == 80 {
+		case 80:
 			//Go ahead
 
-		} else {
+		default:
 			//This port do not support ACME
 			utils.SendErrorResponse(w, "ACME renew only support web server listening on port 80 (http) or 443 (https)")
 			return
 		}
 	}
 
-	//Add a 3 second delay to make sure everything is settle down
-	time.Sleep(3 * time.Second)
+	//Add a 2 second delay to make sure everything is settle down
+	time.Sleep(2 * time.Second)
 
 	// Pass over to the acmeHandler to deal with the communication
 	acmeHandler.HandleRenewCertificate(w, r)
@@ -116,28 +163,68 @@ func AcmeCheckAndHandleRenewCertificate(w http.ResponseWriter, r *http.Request) 
 	//Update the TLS cert store buffer
 	tlsCertManager.UpdateLoadedCertList()
 
-	//Restore original settings
-	if dynamicProxyRouter.Option.Port == 443 && !dnsPara {
-		if !isForceHttpsRedirectEnabledOriginally {
-			//Default is off. Turn the redirection off
-			SystemWideLogger.PrintAndLog("ACME", "Restoring HTTP to HTTPS redirect settings", nil)
-			dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(false)
-		}
+	//Restore original settings only if they were changed
+	if requireRestorePort80 {
+		//Restore port 80 listener
+		SystemWideLogger.PrintAndLog("ACME", "Restoring previous port 80 listener settings", nil)
+		dynamicProxyRouter.UpdatePort80ListenerState(false)
 	}
+	if requireRestoreHttpsRedirect {
+		//Restore HTTP to HTTPS redirect setting that was temporarily enabled
+		SystemWideLogger.PrintAndLog("ACME", "Restoring HTTP to HTTPS redirect settings", nil)
+		dynamicProxyRouter.UpdateHttpToHttpsRedirectSetting(false)
+	}
+
 }
 
 // HandleACMEPreferredCA return the user preferred / default CA for new subdomain auto creation
 func HandleACMEPreferredCA(w http.ResponseWriter, r *http.Request) {
+
+	type PreferredCA struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+		SkipTLS bool `json:"skipTLS"`
+	}
+
 	ca, err := utils.PostPara(r, "set")
 	if err != nil {
 		//Return the current ca to user
 		prefCA := "Let's Encrypt"
+		prefCAURL := ""
+		skipTLS := false
 		sysdb.Read("acmepref", "prefca", &prefCA)
-		js, _ := json.Marshal(prefCA)
+		sysdb.Read("acmepref", "prefcaurl", &prefCAURL)
+		sysdb.Read("acmepref", "skipTLS", &skipTLS)
+		js, _ := json.Marshal(PreferredCA{
+			Name: prefCA,
+			URL:  prefCAURL,
+			SkipTLS: skipTLS,
+		})
 		utils.SendJSONResponse(w, string(js))
 	} else {
 		//Check if the CA is supported
-		acme.IsSupportedCA(ca)
+		isSupported := acme.IsSupportedCA(ca, *acmeTestMode)
+		
+		if !isSupported && ca != "custom" {
+			utils.SendErrorResponse(w, "The specified ACME CA is not supported")
+			return
+		}
+
+		if ca == "custom" {
+			customCAURL, err := utils.PostPara(r, "customURL")
+			customCAURL = strings.TrimSpace(customCAURL)
+			parsedURL, err2 := url.Parse(customCAURL)
+			skipTLS, _ := utils.PostBool(r, "SkipTLS")
+
+			if err != nil || err2 != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+				utils.SendErrorResponse(w, "Invalid custom CA URL provided")
+				return
+			}
+			sysdb.Write("acmepref", "prefcaurl", customCAURL)
+			SystemWideLogger.Println("Updating prefered ACME CA URL to " + customCAURL)
+			sysdb.Write("acmepref", "skipTLS", skipTLS)
+			SystemWideLogger.Println("Updating prefered skipTLS to " + fmt.Sprintf("%t", skipTLS))
+		} 
 		//Set the new config
 		sysdb.Write("acmepref", "prefca", ca)
 		SystemWideLogger.Println("Updating prefered ACME CA to " + ca)
